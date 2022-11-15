@@ -248,29 +248,39 @@ def tensor_is_on_xla(tensors):
 
 
 def timed(model, model_iter_fn, example_inputs, times=1, return_result=False):
+    use_xla = tensor_is_on_xla(example_inputs)
     synchronize()
-    if tensor_is_on_xla(example_inputs):
+
+    reset_rng_state()
+    if use_xla:
         import torch_xla.core.xla_model as xm
 
         xm.mark_step()
+        xm.wait_device_ops()
 
-    reset_rng_state()
     t0 = time.perf_counter()
     # Dont collect outputs to correctly measure timing
     for _ in range(times):
-        result = model_iter_fn(model, example_inputs, collect_outputs=False)
-        if tensor_is_on_xla(result):
+        if use_xla:
+            # force a const seed for xla
+            xm.set_rng_state(23, str(xm.xla_device()))
+        result = model_iter_fn(model, example_inputs, collect_outputs=return_result)
+
+        # instead of calling sync on result_list, we should call mark_step.
+        # In training case, result_list may be empty, but we want to sync
+        # all the pending computations.
+        if use_xla:
             # If the model is on XLA device, it's possible that after running
             # the model, the computation is accumulated but not performed yet.
             # Flush all the accumulated computations to make the time measurement
             # accurate.
-            import torch_xla
+            import torch_xla.core.xla_model as xm
+            xm.mark_step()
 
-            result_list = result
-            if not isinstance(result, (tuple, list)):
-                result_list = [result]
-            torch_xla._XLAC._xla_sync_multi(result_list, [])
-        synchronize()
+    if use_xla:
+        import torch_xla.core.xla_model as xm
+        xm.wait_device_ops()
+    synchronize()
     t1 = time.perf_counter()
     return (t1 - t0, result) if return_result else t1 - t0
 
@@ -380,6 +390,10 @@ def randomize_input(inputs):
             f"randomize_input can not handle input of type {type(inputs)}"
         )
 
+def maybe_mark_step(args):
+    if args.trace_on_xla:
+        import torch_xla.core.xla_model as xm
+        xm.mark_step()
 
 def maybe_mark_step(args):
     if args.trace_on_xla:
@@ -422,6 +436,12 @@ def speedup_experiment(args, model_iter_fn, model, example_inputs, **kwargs):
         else:
             yield
 
+    times = args.iterations_per_run
+
+    # Use higher tolerance for XLA since XLA cause numerical unstability when
+    # graph size changes.
+    tolerance = args.xla_tolerance if args.trace_on_xla else 1e-4
+
     with maybe_profile(enabled=args.export_profiler_trace) as p:
         frozen_model_iter_fn = torch._dynamo.run(model_iter_fn)
         for rep in range(args.repeat):
@@ -438,7 +458,7 @@ def speedup_experiment(args, model_iter_fn, model, example_inputs, **kwargs):
             # interleave the runs to handle frequency scaling and load changes
             with maybe_mark_profile(p=p, mark="expected"):
                 timings[rep, 0], expected_output = timed(
-                    model, model_iter_fn, inputs, return_result=True
+                    model, model_iter_fn, inputs, return_result=True, times=times,
                 )
 
             # call mark_step between the 2 calls to make the comparison fair.
@@ -446,11 +466,11 @@ def speedup_experiment(args, model_iter_fn, model, example_inputs, **kwargs):
 
             with maybe_mark_profile(p=p, mark="actual"):
                 timings[rep, 1], actual_output = timed(
-                    model, frozen_model_iter_fn, inputs, return_result=True
+                    model, frozen_model_iter_fn, inputs, return_result=True, times=times,
                 )
 
             if should_check_result:
-                is_correct = is_correct and same(expected_output, actual_output)
+                is_correct = is_correct and same(expected_output, actual_output, tol=tolerance)
 
     if args.export_profiler_trace:
         name = args.profiler_trace_name + "_" + model.name + ".json"
@@ -1370,6 +1390,15 @@ def parse_args(args=None):
     parser.add_argument(
         "--repeat", "-n", type=int, default=30, help="number of timing runs"
     )
+    iterations_per_run_help = """
+        Run this may iterations for each time measurement. This is mainly used for
+        XLA training. We want to run multiple iterations per measurement so the
+        tracing and computation for different iteartions can overlap with each
+        other. This makes sure we have an accurate xla baseline.
+    """
+    parser.add_argument(
+        "--iterations-per-run", type=int, default=1, help=iterations_per_run_help
+    )
     parser.add_argument(
         "--randomize-input",
         action="store_true",
@@ -1550,6 +1579,12 @@ def parse_args(args=None):
         "--trace-on-xla",
         action="store_true",
         help="Whether to trace the model on XLA or on eager device",
+    )
+    parser.add_argument(
+        "--xla-tolerance",
+        type=float,
+        default=1e-2,
+        help="XLA needs a loose tolerance to pass the correctness check",
     )
 
     group_fuser = parser.add_mutually_exclusive_group()
