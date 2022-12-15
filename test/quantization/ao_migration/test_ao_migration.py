@@ -514,6 +514,7 @@ class TestAOMigrationNNIntrinsic(AOMigrationTestCase):
     def test_modules_intrinsic_quantized_linear_relu(self):
         function_list = [
             'LinearReLU',
+            'LinearTanh',
         ]
         self._test_function_import('linear_relu', function_list,
                                    base='nn.intrinsic.quantized.modules')
